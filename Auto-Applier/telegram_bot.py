@@ -15,18 +15,21 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 _DIR = os.path.dirname(__file__)
 QUEUE_PATH = os.path.join(_DIR, "queue.json")
 STATE_PATH = os.path.join(_DIR, "state_tracker.json")
+ACCOUNTS_PATH = os.path.join(_DIR, "accounts.json")
 
 bot = None
 
 HELP_TEXT = (
     "Commands:\n"
-    "  RUN       — apply to all queued jobs\n"
-    "  SCOUT     — run the scouter now to find new jobs\n"
-    "  STATUS    — queue size, total applied, last application\n"
-    "  QUEUE     — list jobs currently in the queue\n"
-    "  CLEAR     — empty the queue\n"
-    "  HISTORY [N] — last N applied jobs (default 5)\n"
-    "  <URL>     — add a job URL directly to the queue"
+    "  RUN         — apply to all queued jobs\n"
+    "  SCOUT       — run the scouter now to find new jobs\n"
+    "  STATUS      — queue size, applied count, pending assessments\n"
+    "  QUEUE       — list jobs currently in the queue\n"
+    "  CLEAR       — empty the queue\n"
+    "  HISTORY [N] — last N job outcomes (default 5)\n"
+    "  PENDING     — jobs flagged for manual assessment\n"
+    "  ACCOUNTS    — sites where accounts were created\n"
+    "  <URL>       — add a job URL directly to the queue"
 )
 
 
@@ -106,17 +109,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         queue = read_json(QUEUE_PATH, [])
         state_raw = read_json(STATE_PATH, [])
         queue_count = len(queue)
-        applied_count = len(state_raw)
+        applied = [i for i in state_raw if isinstance(i, dict) and i.get("status") == "applied"]
+        pending = [i for i in state_raw if isinstance(i, dict) and i.get("status") == "assessment_required"]
 
         last_line = ""
-        for item in reversed(state_raw):
-            if isinstance(item, dict) and item.get("applied_at"):
-                last_line = f"\nLast applied: {item.get('company', '?')} on {item['applied_at']}"
-                break
+        for item in reversed(applied):
+            ts = item.get("recorded_at") or item.get("applied_at", "?")
+            last_line = f"\nLast applied: {item.get('company', '?')} on {ts}"
+            break
+
+        pending_line = f"\nAssessments pending: {len(pending)} (send PENDING to review)" if pending else ""
 
         msg = (
-            f"Queue:   {queue_count} job(s) waiting\n"
-            f"Applied: {applied_count} total{last_line}"
+            f"Queue:    {queue_count} job(s) waiting\n"
+            f"Applied:  {len(applied)} total{last_line}{pending_line}"
         )
         await context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
         return
@@ -160,16 +166,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=update.effective_chat.id, text="No applications recorded yet.")
             return
         recent = list(reversed(state_raw[-n:]))
-        lines = [f"Last {min(n, len(recent))} application(s):"]
+        lines = [f"Last {min(n, len(recent))} outcome(s):"]
+        STATUS_EMOJI = {"applied": "✓", "assessment_required": "⚠", "skipped": "–"}
         for item in recent:
             if isinstance(item, dict):
                 company = item.get("company", "?")
                 status = item.get("status", "?")
-                applied_at = item.get("applied_at", "?")
+                ts = item.get("recorded_at") or item.get("applied_at", "?")
                 typ = item.get("type", "?")
-                lines.append(f"• {company} [{typ}] {status} — {applied_at}")
+                icon = STATUS_EMOJI.get(status, "?")
+                lines.append(f"{icon} {company} [{typ}] {status} — {ts}")
             else:
-                lines.append(f"• {item}")
+                lines.append(f"  {item}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
+        return
+
+    # ── PENDING ───────────────────────────────────────────────────────
+    if cmd == "PENDING":
+        state_raw = read_json(STATE_PATH, [])
+        pending = [i for i in state_raw if isinstance(i, dict) and i.get("status") == "assessment_required"]
+        if not pending:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="No assessments pending — you're all clear.")
+            return
+        lines = [f"Assessments to complete manually ({len(pending)}):"]
+        for item in pending:
+            company = item.get("company", "?")
+            notes = item.get("notes", "")
+            ts = item.get("recorded_at", "?")
+            url = item.get("url", "")
+            short_url = url[:70] + ("…" if len(url) > 70 else "")
+            lines.append(f"• {company} — {notes} ({ts})\n  {short_url}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
+        return
+
+    # ── ACCOUNTS ──────────────────────────────────────────────────────
+    if cmd == "ACCOUNTS":
+        accounts = read_json(ACCOUNTS_PATH, {})
+        if not accounts:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="No accounts created yet.")
+            return
+        lines = [f"Accounts on file ({len(accounts)} site(s)):"]
+        for domain, entries in accounts.items():
+            count = len(entries)
+            latest_ts = entries[-1].get("created_at", "?") if entries else "?"
+            lines.append(f"• {domain} — {count} account(s), last created {latest_ts}")
+        lines.append("\nCredentials are in accounts.json on your local machine.")
         await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
         return
 

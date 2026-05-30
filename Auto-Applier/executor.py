@@ -87,6 +87,29 @@ def close_playwright_session(browser, context, cdp_url):
     except Exception:
         pass
 
+ASSESSMENT_STOP_RULE = """
+CRITICAL ASSESSMENT RULE — READ CAREFULLY:
+- If at ANY point during the application you encounter an assessment, aptitude test, skills test,
+  personality test, cognitive test, video interview (HireVue, Spark Hire, etc.),
+  coding challenge (HackerRank, Codility, CodeSignal, etc.), or any timed evaluation —
+  STOP IMMEDIATELY. Do NOT attempt or start it.
+- Output exactly on its own line: ASSESSMENT_REQUIRED: <brief description of what you found>
+- The human will complete all assessments manually.
+"""
+
+ASSESSMENT_KEYWORDS = (
+    "complete an assessment", "take an assessment", "start an assessment",
+    "online assessment", "aptitude test", "skills assessment", "skills test",
+    "pre-employment test", "pre-hire assessment", "cognitive test",
+    "situational judgment", "personality test", "work style assessment",
+    "video interview", "video response", "record a video",
+    "hirevue", "spark hire", "myinterview", "video assessment",
+    "coding challenge", "coding test", "code challenge",
+    "hackerrank", "codility", "codesignal", "pymetrics",
+    "wonderlic", "game-based assessment", "korn ferry assessment",
+    "criteria corp", "talent assessment",
+)
+
 WORKDAY_PROMPT_TEMPLATE = """
 You are an expert autonomous application assistant. Your goal is to apply for the job at the current URL using the provided profile data.
 
@@ -251,13 +274,19 @@ def safe_goto(page, url, retries=2):
 
 
 def load_states():
-    """Load state_tracker.json, normalizing both old (list of strings) and new (list of dicts) formats."""
+    """Load state_tracker.json; normalises old (list of strings) and new (list of dicts) formats."""
     raw = read_json(STATE_PATH, [])
     states = {}
     for item in raw:
         if isinstance(item, str):
-            states[item] = {"url": item, "applied_at": None, "company": None, "status": "applied", "type": None}
+            states[item] = {
+                "url": item, "recorded_at": None, "company": None,
+                "status": "applied", "type": None, "notes": None,
+            }
         elif isinstance(item, dict) and item.get("url"):
+            # migrate old applied_at field name
+            if "applied_at" in item and "recorded_at" not in item:
+                item["recorded_at"] = item.pop("applied_at")
             states[item["url"]] = item
     return states
 
@@ -266,14 +295,16 @@ def save_states(states):
     write_json(STATE_PATH, list(states.values()))
 
 
-def mark_applied_state(states, url, job_type=None):
+def mark_job_state(states, url, status, job_type=None, notes=None):
+    """Record a job outcome in the in-memory states dict."""
     company = urlparse(url).hostname or "unknown"
     states[url] = {
         "url": url,
-        "applied_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "company": company,
-        "status": "applied",
+        "status": status,   # "applied" | "assessment_required" | "skipped"
         "type": job_type,
+        "notes": notes,
     }
 
 
@@ -321,6 +352,26 @@ def parse_generated_password(text):
     return None
 
 
+def detect_assessment(page_text: str):
+    """Return (True, matched_keyword) if an assessment is found in the page text."""
+    text = page_text.lower()
+    for kw in ASSESSMENT_KEYWORDS:
+        if kw in text:
+            return True, kw
+    return False, None
+
+
+def parse_assessment_flag(text: str):
+    """Return (True, description) if the LLM reported ASSESSMENT_REQUIRED."""
+    if not text:
+        return False, None
+    for line in text.splitlines():
+        if "ASSESSMENT_REQUIRED" in line:
+            desc = line.split("ASSESSMENT_REQUIRED", 1)[1].lstrip(":").strip()
+            return True, desc or "assessment detected"
+    return False, None
+
+
 def build_agent_task(url, profile):
     email = profile.get("contact_info", {}).get("email", "")
     resume_path = resolve_resume_path(profile) or profile.get("resume_path", "")
@@ -339,7 +390,12 @@ def build_agent_task(url, profile):
         prompt = SMARTRECRUITERS_PROMPT_TEMPLATE.format(resume_path=resume_path)
     else:
         prompt = GENERIC_PROMPT_TEMPLATE.format(resume_path=resume_path)
-    return f"Profile Context:\n{json.dumps(profile, indent=2)}\n\nTask:\n{prompt}\n\nTarget URL: {url}"
+    return (
+        f"Profile Context:\n{json.dumps(profile, indent=2)}\n\n"
+        f"Task:\n{prompt}\n\n"
+        f"{ASSESSMENT_STOP_RULE}\n\n"
+        f"Target URL: {url}"
+    )
 
 
 async def run_browser_agent(task, resume_path):
@@ -487,6 +543,10 @@ def process_taleo_fallback(page, profile, resume_path, email, password):
 def record_account(url, email, password):
     company = urlparse(url).hostname or "unknown"
     save_account_credentials(company, email, password)
+    send_message(
+        f"Account created for {company}.\n"
+        "Credentials saved to accounts.json — check it locally for login details."
+    )
 
 
 def run_executor():
@@ -575,6 +635,23 @@ def run_executor():
 
     ATS_AGENT_KEYWORDS = ("workday", "myworkdayjobs", "taleo", "greenhouse", "lever.co", "icims", "smartrecruiters")
 
+    def snap(path):
+        try:
+            page.screenshot(path=str(path), full_page=True)
+        except Exception:
+            pass
+
+    def flag_assessment(url, job_type, screenshot_path, notes):
+        mark_job_state(states, url, "assessment_required", job_type, notes=notes)
+        save_states(states)
+        try:
+            send_photo(
+                str(screenshot_path),
+                caption=f"Assessment required — do this manually\n{notes}\n{url}",
+            )
+        except Exception:
+            send_message(f"Assessment required at {url}\n{notes}\nComplete it manually.")
+
     for item in queue:
         url = item["url"] if isinstance(item, dict) else item
         job_type = item.get("type") if isinstance(item, dict) else None
@@ -590,6 +667,12 @@ def run_executor():
             if any(k in url.lower() for k in ATS_AGENT_KEYWORDS):
                 if browser_agent_available():
                     response_text, password = process_with_browser_agent(url, profile)
+
+                    is_assessment, assessment_desc = parse_assessment_flag(response_text)
+                    if is_assessment:
+                        flag_assessment(url, job_type, screenshot_path, assessment_desc)
+                        continue
+
                     result = any(
                         kw in response_text.lower()
                         for kw in ("application submitted", "thank you", "submitted", "application received")
@@ -603,6 +686,14 @@ def run_executor():
                         page = get_or_create_page(context)
                         page.set_default_navigation_timeout(120000)
                         safe_goto(page, url)
+
+                        is_assessment, assessment_kw = detect_assessment(page.content())
+                        if is_assessment:
+                            snap(screenshot_path)
+                            close_playwright_session(browser, context, cdp_url)
+                            flag_assessment(url, job_type, screenshot_path, f"Detected: {assessment_kw}")
+                            continue
+
                         email, password = generate_credentials(profile)
                         if "workday" in url.lower() or "myworkdayjobs" in url.lower():
                             result, reason = process_workday_fallback(page, profile, resume_path, email, password)
@@ -610,10 +701,7 @@ def run_executor():
                             result, reason = process_taleo_fallback(page, profile, resume_path, email, password)
                         if result:
                             record_account(url, email, password)
-                        try:
-                            page.screenshot(path=str(screenshot_path), full_page=True)
-                        except Exception:
-                            pass
+                        snap(screenshot_path)
                         close_playwright_session(browser, context, cdp_url)
             else:
                 with sync_playwright() as p:
@@ -621,6 +709,14 @@ def run_executor():
                     page = get_or_create_page(context)
                     page.set_default_navigation_timeout(120000)
                     safe_goto(page, url)
+
+                    is_assessment, assessment_kw = detect_assessment(page.content())
+                    if is_assessment:
+                        snap(screenshot_path)
+                        close_playwright_session(browser, context, cdp_url)
+                        flag_assessment(url, job_type, screenshot_path, f"Detected: {assessment_kw}")
+                        continue
+
                     if "linkedin.com/jobs" in url.lower():
                         result, reason = process_linkedin(page, resume_path)
                     else:
@@ -628,14 +724,11 @@ def run_executor():
                         result, reason = process_generic_career_site(page, profile, resume_path, email, password)
                         if result:
                             record_account(url, email, password)
-                    try:
-                        page.screenshot(path=str(screenshot_path), full_page=True)
-                    except Exception:
-                        pass
+                    snap(screenshot_path)
                     close_playwright_session(browser, context, cdp_url)
 
             if result:
-                mark_applied_state(states, url, job_type)
+                mark_job_state(states, url, "applied", job_type)
                 save_states(states)
                 send_photo(str(screenshot_path), caption=f"Applied: {url}")
             else:
