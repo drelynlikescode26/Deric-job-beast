@@ -106,7 +106,7 @@ CRITICAL WORKDAY INSTRUCTIONS:
    - Personal Info: Use profile details exactly.
    - Current Employment: Use the current employer data exactly as provided.
    - Certifications: Answer the CompTIA Network+ N10-009 certification question as "In progress" or "Studying" if asked.
-   - EEO/Demographics: Use the exact string values from profile.ee0 and do not guess.
+   - EEO/Demographics: Use the exact string values from profile.eeo and do not guess.
 5. RESUME UPLOAD: When you reach resume upload, use the backend file injector and attach the file at '{resume_path}'.
 6. SUBMIT & RECEIPT: Complete the application flow, click the final submit button, and wait for a confirmation screen such as 'Application Submitted' or 'Thank You'.
 7. FINAL RESPONSE: At the end, output only a short confirmation message and include the generated password exactly as: 'Generated Password: <password>'.
@@ -138,6 +138,57 @@ CRITICAL LOGIN RULES - AVOID GOOGLE SSO:
 - Do not invent answers for EEO or certification questions.
 """
 
+GREENHOUSE_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. The URL is on Greenhouse (greenhouse.io or boards.greenhouse.io).
+CRITICAL RULES:
+- Greenhouse typically does NOT require account creation — fill the application form directly.
+- NEVER click "Apply with LinkedIn" or "Apply with Google".
+- Always use the standard form fields.
+1. Click "Apply for this Job" or the primary Apply button.
+2. Fill all required fields (name, email, phone, address) using profile data.
+3. Upload the resume from '{resume_path}'.
+4. Complete any voluntary demographic/EEO sections using profile.eeo values.
+5. Answer any free-text questions clearly and professionally using profile data.
+6. Click the final Submit button and wait for a confirmation page.
+"""
+
+LEVER_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. The URL is on Lever (lever.co or jobs.lever.co).
+CRITICAL RULES:
+- NEVER use "Apply with LinkedIn" or Google SSO.
+- Lever typically shows an inline application form — no account creation needed.
+1. Click "Apply" or "Apply for this position".
+2. Fill all visible fields (name, email, phone, LinkedIn, resume) using profile data.
+3. Upload resume from '{resume_path}'.
+4. Answer any additional written questions using profile data.
+5. Submit the application and wait for a confirmation message.
+"""
+
+ICIMS_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. The URL is on an iCIMS career portal.
+CRITICAL LOGIN RULES - AVOID GOOGLE SSO:
+- NEVER click "Continue with Google", "Sign in with Google", or "Apply with LinkedIn".
+- Look for "Apply Now", "Create Profile", "Sign Up", or "Register" with email and password.
+1. Create a new iCIMS profile using the email: {email} and a newly generated strong password.
+2. IMPORTANT: Output the generated password clearly in your final response as 'Generated Password: <password>'.
+3. Fill all profile sections (personal info, work history, education) using profile data.
+4. Upload resume from '{resume_path}'.
+5. Complete EEO questions using profile.eeo values.
+6. Submit the application and wait for a confirmation screen.
+"""
+
+SMARTRECRUITERS_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. The URL is on SmartRecruiters.
+CRITICAL RULES:
+- NEVER use Google SSO or LinkedIn SSO.
+- SmartRecruiters may allow applying as a guest or with email registration.
+1. Click "Apply" or "Apply Now". Choose guest or email-based flow.
+2. Fill all required fields using profile data.
+3. Upload resume from '{resume_path}'.
+4. Complete EEO sections using profile.eeo values.
+5. Submit and wait for confirmation.
+"""
+
 
 def read_json(path, default):
     try:
@@ -153,23 +204,77 @@ def write_json(path, value):
 
 
 def resolve_resume_path(profile):
+    """Resolve resume: try explicit path first, then find the latest PDF in resume_folder."""
     explicit_path = profile.get("resume_path")
-    if explicit_path and Path(explicit_path).exists():
-        return explicit_path
+    if explicit_path:
+        expanded = Path(os.path.expanduser(explicit_path))
+        if expanded.exists():
+            return str(expanded)
 
     folder = profile.get("resume_folder")
     if folder:
-        folder_path = Path(folder)
+        folder_path = Path(os.path.expanduser(folder))
         if folder_path.is_dir():
-            pdfs = sorted(folder_path.glob("*.pdf"))
+            pdfs = sorted(folder_path.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
             if pdfs:
                 return str(pdfs[0])
+
     return explicit_path
 
 
 def append_failed(url, reason):
     with open(FAILED_PATH, "a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{url}\t{reason}\n")
+
+
+def with_retry(fn, retries=3, delay=2, backoff=2):
+    """Call fn(), retrying up to `retries` times with exponential backoff on any exception."""
+    last_exc = None
+    wait = delay
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(wait)
+                wait *= backoff
+    raise last_exc
+
+
+def safe_goto(page, url, retries=2):
+    """Navigate to url with retries on transient failures."""
+    def go():
+        page.goto(url)
+        time.sleep(2)
+    with_retry(go, retries=retries, delay=3)
+
+
+def load_states():
+    """Load state_tracker.json, normalizing both old (list of strings) and new (list of dicts) formats."""
+    raw = read_json(STATE_PATH, [])
+    states = {}
+    for item in raw:
+        if isinstance(item, str):
+            states[item] = {"url": item, "applied_at": None, "company": None, "status": "applied", "type": None}
+        elif isinstance(item, dict) and item.get("url"):
+            states[item["url"]] = item
+    return states
+
+
+def save_states(states):
+    write_json(STATE_PATH, list(states.values()))
+
+
+def mark_applied_state(states, url, job_type=None):
+    company = urlparse(url).hostname or "unknown"
+    states[url] = {
+        "url": url,
+        "applied_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "company": company,
+        "status": "applied",
+        "type": job_type,
+    }
 
 
 def browser_agent_available():
@@ -218,11 +323,20 @@ def parse_generated_password(text):
 
 def build_agent_task(url, profile):
     email = profile.get("contact_info", {}).get("email", "")
-    resume_path = profile.get("resume_path", "")
-    if "workday" in url.lower():
+    resume_path = resolve_resume_path(profile) or profile.get("resume_path", "")
+    u = url.lower()
+    if "workday" in u or "myworkdayjobs" in u:
         prompt = WORKDAY_PROMPT_TEMPLATE.format(email=email, resume_path=resume_path)
-    elif "taleo" in url.lower():
+    elif "taleo" in u:
         prompt = TALEO_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    elif "greenhouse" in u:
+        prompt = GREENHOUSE_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    elif "lever.co" in u:
+        prompt = LEVER_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    elif "icims" in u:
+        prompt = ICIMS_PROMPT_TEMPLATE.format(email=email, resume_path=resume_path)
+    elif "smartrecruiters" in u:
+        prompt = SMARTRECRUITERS_PROMPT_TEMPLATE.format(resume_path=resume_path)
     else:
         prompt = GENERIC_PROMPT_TEMPLATE.format(resume_path=resume_path)
     return f"Profile Context:\n{json.dumps(profile, indent=2)}\n\nTask:\n{prompt}\n\nTarget URL: {url}"
@@ -266,14 +380,22 @@ def resolve_agent_response(result):
 
 
 def fill_common_fields(page, profile, email, password):
+    info = profile.get("contact_info", profile)
+    first = info.get("first_name") or info.get("name", "").split()[0] if info.get("name") else ""
+    last = info.get("last_name") or (" ".join(info.get("name", "").split()[1:]) if info.get("name") else "")
+    phone = info.get("phone", "")
     fields = {
         "input[name='email']": email,
         "input[name='username']": email,
         "input[name='password']": password,
         "input[name='confirm_password']": password,
-        "input[name='first_name']": profile.get("contact_info", {}).get("name", ""),
-        "input[name='last_name']": profile.get("contact_info", {}).get("name", ""),
-        "input[name='phone']": profile.get("contact_info", {}).get("phone", ""),
+        "input[name='confirmPassword']": password,
+        "input[name='first_name']": first,
+        "input[name='firstName']": first,
+        "input[name='last_name']": last,
+        "input[name='lastName']": last,
+        "input[name='phone']": phone,
+        "input[name='phoneNumber']": phone,
     }
     for selector, value in fields.items():
         try:
@@ -327,9 +449,13 @@ def process_generic_career_site(page, profile, resume_path, email, password):
 
 def process_with_browser_agent(url, profile):
     task = build_agent_task(url, profile)
-    resume_path = profile.get("resume_path", "")
+    resume_path = resolve_resume_path(profile) or profile.get("resume_path", "")
+
+    def run():
+        return asyncio.run(run_browser_agent(task, resume_path))
+
     try:
-        response_text = asyncio.run(run_browser_agent(task, resume_path))
+        response_text = with_retry(run, retries=2, delay=5)
     except asyncio.TimeoutError as e:
         return str(e), None
     except Exception as e:
@@ -442,13 +568,16 @@ def run_executor():
     if not ok:
         return
 
-    states = set(read_json(STATE_PATH, []))
+    states = load_states()
     profile_dir = get_browser_profile_path()
     chrome_path = os.getenv("CHROME_PATH")
     cdp_url = get_chrome_cdp_url()
 
+    ATS_AGENT_KEYWORDS = ("workday", "myworkdayjobs", "taleo", "greenhouse", "lever.co", "icims", "smartrecruiters")
+
     for item in queue:
         url = item["url"] if isinstance(item, dict) else item
+        job_type = item.get("type") if isinstance(item, dict) else None
         if url in states:
             continue
 
@@ -458,10 +587,13 @@ def run_executor():
         screenshot_path = SCREENSHOT_DIR / f"{int(time.time())}.png"
 
         try:
-            if "workday" in url.lower() or "taleo" in url.lower():
+            if any(k in url.lower() for k in ATS_AGENT_KEYWORDS):
                 if browser_agent_available():
                     response_text, password = process_with_browser_agent(url, profile)
-                    result = "application submitted" in response_text.lower() or "thank you" in response_text.lower() or "submitted" in response_text.lower()
+                    result = any(
+                        kw in response_text.lower()
+                        for kw in ("application submitted", "thank you", "submitted", "application received")
+                    )
                     if password:
                         record_account(url, profile.get("contact_info", {}).get("email", ""), password)
                     reason = response_text[:512]
@@ -470,10 +602,9 @@ def run_executor():
                         browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
                         page = get_or_create_page(context)
                         page.set_default_navigation_timeout(120000)
-                        page.goto(url)
-                        time.sleep(2)
+                        safe_goto(page, url)
                         email, password = generate_credentials(profile)
-                        if "workday" in url.lower():
+                        if "workday" in url.lower() or "myworkdayjobs" in url.lower():
                             result, reason = process_workday_fallback(page, profile, resume_path, email, password)
                         else:
                             result, reason = process_taleo_fallback(page, profile, resume_path, email, password)
@@ -489,8 +620,7 @@ def run_executor():
                     browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
                     page = get_or_create_page(context)
                     page.set_default_navigation_timeout(120000)
-                    page.goto(url)
-                    time.sleep(2)
+                    safe_goto(page, url)
                     if "linkedin.com/jobs" in url.lower():
                         result, reason = process_linkedin(page, resume_path)
                     else:
@@ -505,8 +635,8 @@ def run_executor():
                     close_playwright_session(browser, context, cdp_url)
 
             if result:
-                states.add(url)
-                write_json(STATE_PATH, list(states))
+                mark_applied_state(states, url, job_type)
+                save_states(states)
                 send_photo(str(screenshot_path), caption=f"Applied: {url}")
             else:
                 append_failed(url, reason)

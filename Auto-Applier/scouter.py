@@ -72,16 +72,50 @@ def normalize_link(base, href):
     return urljoin(base, href).split("#")[0]
 
 
+CAREER_SITE_KEYWORDS = (
+    "workday", "myworkdayjobs", "taleo", "icims", "greenhouse",
+    "lever.co", "smartrecruiters", "jobvite", "breezy", "bamboohr",
+    "successfactors", "ultipro", "silkroad", "applicantpro", "oracle.com/hcm",
+)
+
+
 def classify_link(url, page_text):
     u = url.lower()
     text = page_text.lower()
-    if "linkedin.com/jobs/view" in u or "/jobs/view/" in u or "easy apply" in u or "easy apply" in text:
+    if "linkedin.com/jobs/view" in u or "/jobs/view/" in u:
         return "EASY_APPLY"
-    if "workday" in u or "taleo" in u or "icims" in u or "greenhouse" in u or "lever" in u:
+    if "easy apply" in text:
+        return "EASY_APPLY"
+    for kw in CAREER_SITE_KEYWORDS:
+        if kw in u:
+            return "CAREER_SITE"
+    if "apply now" in text or "apply for this" in text:
         return "CAREER_SITE"
-    if "easy apply" in text or "apply now" in text:
-        return "EASY_APPLY"
     return "CAREER_SITE"
+
+
+def score_job(url, page_text, profile):
+    """Score 0–100: how closely the job matches target roles and preferred locations."""
+    score = 40
+    target_roles = profile.get("target_roles", [])
+    combined = (url + " " + page_text).lower()
+
+    for role in target_roles:
+        for word in role.lower().split():
+            if len(word) > 3 and word in combined:
+                score += 6
+                break
+
+    for loc_word in ("athens", "atlanta", "remote", "hybrid"):
+        if loc_word in combined:
+            score += 4
+
+    for penalty in ("senior director", "vp ", "vice president", "executive director", "internship", "intern "):
+        if penalty in combined:
+            score -= 40
+            break
+
+    return max(0, min(100, score))
 
 
 def is_job_link(url):
@@ -198,7 +232,11 @@ async def scout_once_async():
         send_message("Scouter: no targets configured in profile.json.")
         return []
 
-    existing = set(read_json(STATE_PATH, []))
+    raw_state = read_json(STATE_PATH, [])
+    existing = set(
+        item if isinstance(item, str) else item.get("url", "")
+        for item in raw_state
+    )
     queued = read_json(QUEUE_PATH, [])
     queued_urls = {item["url"] if isinstance(item, dict) else item for item in queued}
 
@@ -237,6 +275,7 @@ async def scout_once_async():
                     else:
                         candidate_links = await collect_links(page, target)
 
+                    scored = []
                     for link in candidate_links:
                         if link in existing or link in queued_urls:
                             continue
@@ -249,11 +288,17 @@ async def scout_once_async():
                         except Exception:
                             page_text = ""
                         typ = classify_link(link, page_text)
+                        job_score = score_job(link, page_text, profile)
+                        scored.append((job_score, link, typ))
+
+                    scored.sort(key=lambda x: x[0], reverse=True)
+
+                    for job_score, link, typ in scored:
                         if typ == "EASY_APPLY" and easy_count < easy_limit:
-                            results.append({"url": link, "type": typ, "source": "scouter"})
+                            results.append({"url": link, "type": typ, "source": "scouter", "score": job_score})
                             easy_count += 1
                         elif typ == "CAREER_SITE" and career_count < career_limit:
-                            results.append({"url": link, "type": typ, "source": "scouter"})
+                            results.append({"url": link, "type": typ, "source": "scouter", "score": job_score})
                             career_count += 1
                         if easy_count >= easy_limit and career_count >= career_limit:
                             break
@@ -290,6 +335,7 @@ async def scout_once_async():
                         else:
                             candidate_links = await collect_links(page, target)
 
+                        scored = []
                         for link in candidate_links:
                             if link in existing or link in queued_urls:
                                 continue
@@ -302,11 +348,17 @@ async def scout_once_async():
                             except Exception:
                                 page_text = ""
                             typ = classify_link(link, page_text)
+                            job_score = score_job(link, page_text, profile)
+                            scored.append((job_score, link, typ))
+
+                        scored.sort(key=lambda x: x[0], reverse=True)
+
+                        for job_score, link, typ in scored:
                             if typ == "EASY_APPLY" and easy_count < easy_limit:
-                                results.append({"url": link, "type": typ, "source": "scouter"})
+                                results.append({"url": link, "type": typ, "source": "scouter", "score": job_score})
                                 easy_count += 1
                             elif typ == "CAREER_SITE" and career_count < career_limit:
-                                results.append({"url": link, "type": typ, "source": "scouter"})
+                                results.append({"url": link, "type": typ, "source": "scouter", "score": job_score})
                                 career_count += 1
                             if easy_count >= easy_limit and career_count >= career_limit:
                                 break
