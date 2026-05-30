@@ -1,0 +1,8 @@
+python-telegram-bot==20.3
+playwright
+python-dotenv
+apscheduler
+pytest
+pytest-mock
+flake8
+black

@@ -1,0 +1,18 @@
+{
+  "name": "Jane Doe",
+  "email": "jane.doe@example.com",
+  "phone": "+15555555555",
+  "address": "123 Main St, Anytown, USA",
+  "resume_path": "/absolute/path/to/resume.pdf",
+  "eeo": {
+    "race": "Prefer not to say",
+    "veteran": false,
+    "disability": false
+  },
+  "notes": "Dummy profile for testing",
+  "targets": [
+    "https://careers.example.com",
+    "https://www.example.com/careers",
+    "https://www.linkedin.com/jobs/"
+  ]
+}
