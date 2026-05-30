@@ -51,9 +51,16 @@
     "Technical Support Representative"
   ],
   "targets": [
-    "https://www.linkedin.com/jobs/",
-    "https://www.amazon.jobs/",
-    "https://careers.example.com"
+    "https://www.linkedin.com/jobs/search/?keywords=Network+Technician&location=Athens%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=Network+Technician&location=Atlanta%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=IT+Support+Specialist&location=Athens%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=IT+Support+Specialist&location=Atlanta%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=Systems+Administrator&location=Atlanta%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=Technical+Support+Representative&location=Athens%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=Infrastructure+Analyst&location=Atlanta%2C+GA&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=IT+Support+Specialist&f_TPR=r604800&f_WT=2",
+    "https://www.amazon.jobs/en/search?base_query=IT+Support+Specialist&loc_query=Georgia%2C+United+States",
+    "https://www.amazon.jobs/en/search?base_query=Network+Technician&loc_query=Georgia%2C+United+States"
   ],
   "work_history": [
     {
