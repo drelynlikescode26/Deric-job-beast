@@ -240,8 +240,8 @@ async def scout_once_async():
     queued = read_json(QUEUE_PATH, [])
     queued_urls = {item["url"] if isinstance(item, dict) else item for item in queued}
 
-    easy_limit = 2
-    career_limit = 1
+    easy_limit = int(profile.get("max_easy_apply", 5))
+    career_limit = int(profile.get("max_career_site", 2))
     easy_count = 0
     career_count = 0
     results = []

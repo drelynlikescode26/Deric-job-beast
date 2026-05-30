@@ -179,6 +179,49 @@ def test_parse_assessment_flag_negative():
     assert found is False
 
 
+def test_get_or_create_credentials_new():
+    """No existing account → should generate fresh credentials."""
+    import json, tempfile, os
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump({}, f)
+        tmp = f.name
+
+    original = executor.ACCOUNTS_PATH
+    executor.ACCOUNTS_PATH = Path(tmp)
+    try:
+        email, password, is_new = executor.get_or_create_credentials("https://company.workday.com/job/1", PROFILE)
+        assert is_new is True
+        assert "@" in email
+        assert len(password) >= 12
+    finally:
+        executor.ACCOUNTS_PATH = original
+        os.unlink(tmp)
+
+
+def test_get_or_create_credentials_existing():
+    """Existing account for domain → should return stored credentials."""
+    import json, tempfile, os
+    from pathlib import Path
+
+    stored = {"company.workday.com": [{"email": "saved@test.com", "password": "saved-pass", "status": "Created", "created_at": "2025-01-01"}]}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(stored, f)
+        tmp = f.name
+
+    original = executor.ACCOUNTS_PATH
+    executor.ACCOUNTS_PATH = Path(tmp)
+    try:
+        email, password, is_new = executor.get_or_create_credentials("https://company.workday.com/job/99", PROFILE)
+        assert is_new is False
+        assert email == "saved@test.com"
+        assert password == "saved-pass"
+    finally:
+        executor.ACCOUNTS_PATH = original
+        os.unlink(tmp)
+
+
 def test_load_states_migrates_applied_at():
     """Old entries with applied_at should be migrated to recorded_at."""
     import json, tempfile, os

@@ -212,6 +212,37 @@ CRITICAL RULES:
 5. Submit and wait for confirmation.
 """
 
+LINKEDIN_EASY_APPLY_PROMPT_TEMPLATE = """
+You are an expert autonomous job application assistant completing a LinkedIn Easy Apply.
+
+RULES:
+- You are already logged into LinkedIn on a dedicated application account.
+  Do NOT log out, switch accounts, or navigate away from the job page.
+- Stay entirely within LinkedIn's Easy Apply modal.
+
+EASY APPLY STEPS — work through every step until submission:
+1. Click the "Easy Apply" button to open the modal.
+2. CONTACT INFO step:
+   - Phone: profile.contact_info.phone
+   - City/Location: profile.contact_info.city + state
+   - Click Next.
+3. RESUME step:
+   - Upload the resume from: '{resume_path}'
+   - If a resume is already attached, verify it is the correct file and continue.
+   - Click Next.
+4. ADDITIONAL QUESTIONS — answer these consistently every time:
+   - "Legally authorized to work in the US?" → Yes (from profile.work_authorization.authorized_us)
+   - "Require sponsorship now or in the future?" → No (from profile.work_authorization.requires_sponsorship)
+   - "Currently employed?" → Yes
+   - "Years of experience with [skill]?" → calculate from work history; default to 1-2 if unclear
+   - Salary/compensation inputs → enter a reasonable market-rate number for the role
+   - "How did you hear about us?" → LinkedIn
+   - Click Next after each step.
+5. REVIEW step: confirm information looks correct, then click "Submit application".
+6. Wait for "Your application was sent" or "Application submitted" confirmation.
+7. Output: Application submitted successfully.
+"""
+
 
 def read_json(path, default):
     try:
@@ -376,7 +407,9 @@ def build_agent_task(url, profile):
     email = profile.get("contact_info", {}).get("email", "")
     resume_path = resolve_resume_path(profile) or profile.get("resume_path", "")
     u = url.lower()
-    if "workday" in u or "myworkdayjobs" in u:
+    if "linkedin.com" in u:
+        prompt = LINKEDIN_EASY_APPLY_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    elif "workday" in u or "myworkdayjobs" in u:
         prompt = WORKDAY_PROMPT_TEMPLATE.format(email=email, resume_path=resume_path)
     elif "taleo" in u:
         prompt = TALEO_PROMPT_TEMPLATE.format(resume_path=resume_path)
@@ -540,6 +573,182 @@ def process_taleo_fallback(page, profile, resume_path, email, password):
     return False, "taleo-no-submit"
 
 
+def get_or_create_credentials(url, profile):
+    """Return (email, password, is_new). Reuses existing site credentials if present."""
+    company = urlparse(url).hostname or "unknown"
+    accounts = read_json(ACCOUNTS_PATH, {})
+    if company in accounts and accounts[company]:
+        latest = accounts[company][-1]
+        return latest["email"], latest["password"], False
+    email, password = generate_credentials(profile)
+    return email, password, True
+
+
+def _try_signin(page, email, password):
+    """Attempt sign-in with existing credentials. Returns True if login likely succeeded."""
+    try:
+        # Look for or reveal sign-in form
+        if not page.query_selector("input[type='password']"):
+            safe_click(page, "button:has-text('Sign In'), a:has-text('Sign In'), button:has-text('Log In'), a:has-text('Log In')")
+            time.sleep(1)
+        el_email = page.query_selector("input[name='email'], input[type='email'], input[name='username']")
+        el_pass = page.query_selector("input[type='password']")
+        if not el_email or not el_pass:
+            return False
+        el_email.fill(email)
+        el_pass.fill(password)
+        safe_click(page, "button[type='submit'], button:has-text('Sign In'), button:has-text('Log In')")
+        time.sleep(2)
+        content = page.content().lower()
+        error_phrases = ("invalid", "incorrect", "wrong password", "not found", "doesn't match", "error")
+        if any(p in content for p in error_phrases):
+            return False
+        # If a password field is still visible we likely didn't advance past login
+        if page.query_selector("input[type='password']") and "sign in" in content:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _fill_linkedin_modal_text_fields(page, profile):
+    """Fill visible text inputs inside the LinkedIn Easy Apply modal."""
+    info = profile.get("contact_info", {})
+    for id_fragments, value in [
+        (["phoneNumber", "phone", "mobilePhone"], info.get("phone", "")),
+        (["firstName"], info.get("first_name", "")),
+        (["lastName"], info.get("last_name", "")),
+        (["city", "location"], info.get("city", "")),
+    ]:
+        if not value:
+            continue
+        for frag in id_fragments:
+            try:
+                el = page.query_selector(f"input[id*='{frag}' i], input[name*='{frag}' i]")
+                if el and el.is_visible() and not el.input_value():
+                    el.fill(value)
+                    break
+            except Exception:
+                pass
+
+
+def _click_label_answer(container_el, answer_text):
+    """Click a label inside a form element container matching answer_text."""
+    try:
+        for label in container_el.query_selector_all("label, span[role='radio'], div[role='radio']"):
+            if answer_text.lower() in label.inner_text().lower():
+                label.click()
+                return True
+        # Binary Yes/No radio fallback
+        radios = container_el.query_selector_all("input[type='radio']")
+        if len(radios) == 2:
+            radios[0 if answer_text.lower() in ("yes", "true") else 1].click()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _handle_linkedin_modal_questions(page, profile):
+    """Handle work-auth, sponsorship, experience, and other common EasyApply questions."""
+    auth = profile.get("work_authorization", {})
+    authorized = auth.get("authorized_us", True)
+    needs_sponsorship = auth.get("requires_sponsorship", False)
+
+    try:
+        containers = page.query_selector_all(
+            ".jobs-easy-apply-form-element, [data-test-form-element], "
+            ".fb-form-element, .jobs-easy-apply-form-section__form-item"
+        )
+        for el in containers:
+            try:
+                text = el.inner_text().lower()
+            except Exception:
+                continue
+            if "authorized" in text or "legally authorized" in text or "eligible to work" in text:
+                _click_label_answer(el, "Yes" if authorized else "No")
+            elif "sponsorship" in text or "sponsor" in text or "visa" in text:
+                _click_label_answer(el, "No" if not needs_sponsorship else "Yes")
+            elif "currently employed" in text or "are you employed" in text:
+                _click_label_answer(el, "Yes")
+            elif "how did you hear" in text or "referred by" in text:
+                _click_label_answer(el, "LinkedIn")
+    except Exception:
+        pass
+
+    # Fill blank number inputs (years of experience, etc.) with a safe default
+    try:
+        for inp in page.query_selector_all("input[type='number']"):
+            if inp.is_visible() and not inp.input_value():
+                inp.fill("2")
+    except Exception:
+        pass
+
+    # Fill blank text-area follow-up questions with a generic professional answer
+    try:
+        for ta in page.query_selector_all("textarea"):
+            if ta.is_visible() and not ta.input_value():
+                ta.fill("I am a strong candidate with relevant experience and look forward to contributing to the team.")
+    except Exception:
+        pass
+
+
+def process_linkedin_easy_apply(page, resume_path, profile):
+    """Walk the LinkedIn Easy Apply multi-step modal end-to-end."""
+    # Open the modal
+    opened = safe_click(
+        page,
+        "button:has-text('Easy Apply'), "
+        ".jobs-apply-button--top-card, "
+        "button.jobs-apply-button, "
+        "[data-control-name='jobdetails_topcard_inapply']"
+    )
+    if not opened:
+        return False, "linkedin-no-easy-apply-button"
+    time.sleep(2)
+
+    for _step in range(15):  # safety cap — LinkedIn rarely exceeds 8 steps
+        page_text = page.content()
+
+        # Assessment check at every step
+        is_assessment, kw = detect_assessment(page_text)
+        if is_assessment:
+            return False, f"assessment:{kw}"
+
+        # Populate whatever is visible
+        _fill_linkedin_modal_text_fields(page, profile)
+        _handle_linkedin_modal_questions(page, profile)
+        upload_resume(page, resume_path)
+
+        # Final submission
+        if safe_click(
+            page,
+            "button:has-text('Submit application'), "
+            "button[aria-label='Submit application'], "
+            "button[data-control-name='submit_unify']"
+        ):
+            time.sleep(3)
+            content = page.content().lower()
+            if any(k in content for k in ("application was sent", "submitted", "thank you for applying")):
+                return True, "submitted"
+            return True, "submit-clicked"  # clicked but couldn't confirm — assume ok
+
+        # Advance to the next step
+        advanced = safe_click(
+            page,
+            "button:has-text('Next'), "
+            "button:has-text('Continue'), "
+            "button:has-text('Review'), "
+            "button[aria-label='Continue to next step'], "
+            "button[data-control-name='continue_unify']"
+        )
+        if not advanced:
+            return False, "linkedin-modal-stuck"
+        time.sleep(1.5)
+
+    return False, "linkedin-max-steps-exceeded"
+
+
 def record_account(url, email, password):
     company = urlparse(url).hostname or "unknown"
     save_account_credentials(company, email, password)
@@ -633,7 +842,10 @@ def run_executor():
     chrome_path = os.getenv("CHROME_PATH")
     cdp_url = get_chrome_cdp_url()
 
-    ATS_AGENT_KEYWORDS = ("workday", "myworkdayjobs", "taleo", "greenhouse", "lever.co", "icims", "smartrecruiters")
+    ATS_AGENT_KEYWORDS = (
+        "linkedin.com", "workday", "myworkdayjobs", "taleo",
+        "greenhouse", "lever.co", "icims", "smartrecruiters",
+    )
 
     def snap(path):
         try:
@@ -694,16 +906,32 @@ def run_executor():
                             flag_assessment(url, job_type, screenshot_path, f"Detected: {assessment_kw}")
                             continue
 
-                        email, password = generate_credentials(profile)
-                        if "workday" in url.lower() or "myworkdayjobs" in url.lower():
-                            result, reason = process_workday_fallback(page, profile, resume_path, email, password)
+                        u_lower = url.lower()
+                        if "linkedin.com" in u_lower:
+                            result, reason = process_linkedin_easy_apply(page, resume_path, profile)
+                            if reason.startswith("assessment:"):
+                                snap(screenshot_path)
+                                close_playwright_session(browser, context, cdp_url)
+                                flag_assessment(url, job_type, screenshot_path, f"LinkedIn modal: {reason[11:]}")
+                                continue
                         else:
-                            result, reason = process_taleo_fallback(page, profile, resume_path, email, password)
-                        if result:
-                            record_account(url, email, password)
+                            email, password, is_new = get_or_create_credentials(url, profile)
+                            if not is_new and not _try_signin(page, email, password):
+                                email, password = generate_credentials(profile)
+                                is_new = True
+                            if is_new:
+                                safe_click(page, "button:has-text('Create Account'), a:has-text('Register'), button:has-text('Sign Up')")
+                                time.sleep(1)
+                            if "workday" in u_lower or "myworkdayjobs" in u_lower:
+                                result, reason = process_workday_fallback(page, profile, resume_path, email, password)
+                            else:
+                                result, reason = process_taleo_fallback(page, profile, resume_path, email, password)
+                            if result and is_new:
+                                record_account(url, email, password)
                         snap(screenshot_path)
                         close_playwright_session(browser, context, cdp_url)
             else:
+                # Non-ATS sites (generic career pages)
                 with sync_playwright() as p:
                     browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
                     page = get_or_create_page(context)
@@ -717,13 +945,13 @@ def run_executor():
                         flag_assessment(url, job_type, screenshot_path, f"Detected: {assessment_kw}")
                         continue
 
-                    if "linkedin.com/jobs" in url.lower():
-                        result, reason = process_linkedin(page, resume_path)
-                    else:
+                    email, password, is_new = get_or_create_credentials(url, profile)
+                    if not is_new and not _try_signin(page, email, password):
                         email, password = generate_credentials(profile)
-                        result, reason = process_generic_career_site(page, profile, resume_path, email, password)
-                        if result:
-                            record_account(url, email, password)
+                        is_new = True
+                    result, reason = process_generic_career_site(page, profile, resume_path, email, password)
+                    if result and is_new:
+                        record_account(url, email, password)
                     snap(screenshot_path)
                     close_playwright_session(browser, context, cdp_url)
 

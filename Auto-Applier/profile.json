@@ -41,6 +41,12 @@
   },
   "resume_folder": "/Users/deric/Documents/Important Documents(Drelyn)/Resumes/job-beast-resumes",
   "resume_path": "/Users/deric/Documents/Important Documents(Drelyn)/Resumes/job-beast-resumes/Drelyn_Walker_IT_Support.pdf",
+  "work_authorization": {
+    "authorized_us": true,
+    "requires_sponsorship": false
+  },
+  "max_easy_apply": 5,
+  "max_career_site": 2,
   "target_roles": [
     "Network Technician",
     "Infrastructure Analyst",
