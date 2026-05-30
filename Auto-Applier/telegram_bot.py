@@ -3,6 +3,7 @@
 import os
 import threading
 import json
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -12,13 +13,32 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 QUEUE_PATH = os.path.join(os.path.dirname(__file__), "queue.json")
 
-bot = Bot(TOKEN) if TOKEN else None
+bot = None
+
+def get_bot():
+    """Lazily initialize the Telegram Bot to avoid import-time network/HTTP client creation."""
+    global bot
+    if bot is None and TOKEN:
+        try:
+            bot = Bot(TOKEN)
+        except Exception:
+            bot = None
+    return bot
 
 
 def append_to_queue(url: str):
     try:
+        if not os.path.exists(QUEUE_PATH):
+            with open(QUEUE_PATH, "w") as f:
+                json.dump([], f)
+
         with open(QUEUE_PATH, "r+") as f:
-            q = json.load(f)
+            try:
+                q = json.load(f)
+            except json.JSONDecodeError:
+                q = []
+            if not isinstance(q, list):
+                q = []
             q.append({"source": "telegram", "url": url})
             f.seek(0)
             json.dump(q, f, indent=2)
@@ -52,15 +72,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=update.effective_chat.id, text="Send a job URL to add to queue, or reply 'RUN' to execute the queue.")
 
 
+def _async_send_message(text: str):
+    """Helper coroutine for send_message."""
+    b = get_bot()
+    if b and CHAT_ID:
+        return b.send_message(chat_id=int(CHAT_ID), text=text)
+    return None
+
+
+def _async_send_photo(path: str, caption: str | None = None):
+    """Helper coroutine for send_photo."""
+    async def _send():
+        b = get_bot()
+        if b and CHAT_ID:
+            with open(path, "rb") as f:
+                return await b.send_photo(chat_id=int(CHAT_ID), photo=f, caption=caption)
+    return _send()
+
+
 def send_message(text: str):
-    if bot and CHAT_ID:
-        bot.send_message(chat_id=int(CHAT_ID), text=text)
+    try:
+        coro = _async_send_message(text)
+        if coro:
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.ensure_future(coro)
+            except RuntimeError:
+                asyncio.run(coro)
+    except Exception:
+        pass
 
 
 def send_photo(path: str, caption: str | None = None):
-    if bot and CHAT_ID:
-        with open(path, "rb") as f:
-            bot.send_photo(chat_id=int(CHAT_ID), photo=f, caption=caption)
+    try:
+        if not os.path.exists(path):
+            return
+        coro = _async_send_photo(path, caption)
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.ensure_future(coro)
+        except RuntimeError:
+            asyncio.run(coro)
+    except Exception:
+        pass
 
 
 def main():

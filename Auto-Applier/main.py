@@ -9,9 +9,11 @@ from apscheduler.triggers.cron import CronTrigger
 
 
 def run_bot():
-    from telegram_bot import main as bot_main
-
-    bot_main()
+    try:
+        from telegram_bot import main as bot_main
+        bot_main()
+    except Exception as exc:
+        print(f"Telegram bot failed to start: {exc}")
 
 
 def run_scout_once():
@@ -38,14 +40,15 @@ def main():
     parser.add_argument("--scout-now", action="store_true", help="Run the scouter once at startup")
     args = parser.parse_args()
 
+    if args.scout_now:
+        print("Running scouter now...")
+        run_scout_once()
+        return
+
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
     time.sleep(1)
     print("Telegram bot started in the background.")
-
-    if args.scout_now:
-        print("Running scouter now...")
-        run_scout_once()
 
     schedule_daily_scout()
 

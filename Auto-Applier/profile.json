@@ -1,18 +1,76 @@
 {
-  "name": "Jane Doe",
-  "email": "jane.doe@example.com",
-  "phone": "+15555555555",
-  "address": "123 Main St, Anytown, USA",
-  "resume_path": "/absolute/path/to/resume.pdf",
-  "eeo": {
-    "race": "Prefer not to say",
-    "veteran": false,
-    "disability": false
+  "contact_info": {
+    "first_name": "Drelyn",
+    "last_name": "Walker",
+    "name": "Drelyn Walker",
+    "email": "drelynwalker20@gmail.com",
+    "phone": "6784690254",
+    "linkedin": "linkedin.com/in/drelyn-walker-832302160",
+    "address": "",
+    "city": "Athens",
+    "state": "GA",
+    "zip": "30601"
   },
-  "notes": "Dummy profile for testing",
+  "location_constraints": "Apply to Athens, GA / Atlanta, GA / Remote / Hybrid per preferences.",
+  "current_employment": {
+    "employer": "Prime Communications (AT&T Authorized Retailer)",
+    "title": "Wireless Sales & Customer Support Representative",
+    "status": "currently employed",
+    "answer": "Currently employed at Prime Communications as Wireless Sales & Customer Support Representative."
+  },
+  "certifications": [
+    {
+      "name": "CompTIA Network+ N10-009",
+      "status": "in-progress",
+      "detail": "Actively studying for the CompTIA Network+ N10-009 exam; answer certification questions as 'In progress' or 'Studying'."
+    },
+    {
+      "name": "CompTIA Security+",
+      "status": "in-progress"
+    },
+    {
+      "name": "Microsoft Azure Fundamentals (AZ-900)",
+      "status": "in-progress"
+    }
+  ],
+  "eeo": {
+    "gender": "Male",
+    "race": "Black or African American",
+    "veteran": "Not a Veteran",
+    "disability": "No Disability"
+  },
+  "resume_folder": "/Users/deric/Documents/Important Documents(Drelyn)/Resumes/job-beast-resumes",
+  "resume_path": "/Users/deric/Documents/Important Documents(Drelyn)/Resumes/job-beast-resumes/Drelyn_Walker_IT_Support.pdf",
+  "target_roles": [
+    "Network Technician",
+    "Infrastructure Analyst",
+    "IT Support Specialist",
+    "Systems Administrator",
+    "Customer Success Associate",
+    "Customer Service Team Lead",
+    "Technical Support Representative"
+  ],
   "targets": [
-    "https://careers.example.com",
-    "https://www.example.com/careers",
-    "https://www.linkedin.com/jobs/"
+    "https://www.linkedin.com/jobs/",
+    "https://www.amazon.jobs/",
+    "https://careers.example.com"
+  ],
+  "work_history": [
+    {
+      "employer": "Prime Communications — AT&T Authorized Retailer",
+      "title": "Wireless Sales & Customer Support Representative",
+      "location": "Athens, GA",
+      "start": "2025-11",
+      "end": "Present",
+      "summary": "Frontline customer support and sales for AT&T wireless, internet, and connected services. Endpoint device troubleshooting, CRM documentation, product education."
+    },
+    {
+      "employer": "Amazon Fulfillment Center (PGA1)",
+      "title": "Operations Associate & Peer Trainer",
+      "location": "Pendergrass, GA",
+      "start": "2024-01",
+      "end": "2025-08",
+      "summary": "High-volume fulfillment operations, new associate onboarding and training, SOP adherence, performance benchmarking."
+    }
   ]
 }

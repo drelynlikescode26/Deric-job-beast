@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Executor: processes queued jobs and applies using Playwright automation."""
+"""Executor: processes queued jobs and applies using Playwright or browser-use with prompt routing."""
+import asyncio
 import json
 import os
 import secrets
@@ -7,7 +8,20 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+
+try:
+    from browser_use import Agent
+    from browser_use.browser.browser import Browser, BrowserConfig
+    from langchain_openai import ChatOpenAI
+except Exception:
+    Agent = None
+    Browser = None
+    BrowserConfig = None
+    ChatOpenAI = None
+
+load_dotenv()
 
 ROOT = Path(__file__).parent
 PROFILE_PATH = ROOT / "profile.json"
@@ -17,8 +31,112 @@ ACCOUNTS_PATH = ROOT / "accounts.json"
 FAILED_PATH = ROOT / "failed_jobs.txt"
 SCREENSHOT_DIR = ROOT / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+BROWSER_PROFILE_PATH = ROOT / "chrome_profile"
+BROWSER_PROFILE_PATH.mkdir(exist_ok=True)
 
 from telegram_bot import send_message, send_photo
+
+
+def get_chrome_cdp_url():
+    return os.getenv("CHROME_CDP_URL") or os.getenv("BROWSER_CDP_URL")
+
+
+def get_browser_profile_path():
+    env_path = os.getenv("BROWSER_PROFILE_PATH")
+    if env_path:
+        profile_dir = Path(env_path)
+    else:
+        profile_dir = BROWSER_PROFILE_PATH
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return profile_dir
+
+
+def get_or_create_page(context):
+    if context.pages:
+        return context.pages[0]
+    return context.new_page()
+
+
+def connect_playwright_context(playwright, cdp_url, profile_dir, chrome_path):
+    browser = None
+    if cdp_url:
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        if browser.contexts:
+            return browser, browser.contexts[0]
+        return browser, browser.new_context()
+    if profile_dir:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=False,
+            executable_path=chrome_path if chrome_path else None,
+        )
+        return None, context
+    browser = playwright.chromium.launch(headless=False, executable_path=chrome_path if chrome_path else None)
+    return browser, browser.new_context()
+
+
+def close_playwright_session(browser, context, cdp_url):
+    try:
+        if context and not cdp_url:
+            context.close()
+    except Exception:
+        pass
+    try:
+        if browser and not cdp_url:
+            browser.close()
+    except Exception:
+        pass
+
+WORKDAY_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. Your goal is to apply for the job at the current URL using the provided profile data.
+
+CRITICAL LOGIN RULES - AVOID GOOGLE SSO:
+- NEVER click "Continue with Google", "Sign in with Google", or "Apply with LinkedIn".
+- ALWAYS look for and click "Apply Manually", "Use Email and Password", "Create Account", or "Register".
+- If presented with a choice, choose the native email/password account creation route.
+
+CRITICAL WORKDAY INSTRUCTIONS:
+1. LOOK FOR ACCESS GATE: Look at the page. If you see 'Sign In', 'Apply', or 'Apply Manually' button, click it.
+2. ACCOUNT CREATION: If prompted to log in or create an account, click 'Create Account' or 'Sign Up' and complete registration.
+3. CREDENTIAL GENERATION:
+   - Use the primary email provided in the profile: {email}
+   - Generate a unique, random, strong password using uppercase, lowercase, numbers, and symbols.
+   - IMPORTANT: Output the generated password clearly in the final response as 'Generated Password: <password>'.
+4. FORM COMPLETION:
+   - Personal Info: Use profile details exactly.
+   - Current Employment: Use the current employer data exactly as provided.
+   - Certifications: Answer the CompTIA Network+ N10-009 certification question as "In progress" or "Studying" if asked.
+   - EEO/Demographics: Use the exact string values from profile.ee0 and do not guess.
+5. RESUME UPLOAD: When you reach resume upload, use the backend file injector and attach the file at '{resume_path}'.
+6. SUBMIT & RECEIPT: Complete the application flow, click the final submit button, and wait for a confirmation screen such as 'Application Submitted' or 'Thank You'.
+7. FINAL RESPONSE: At the end, output only a short confirmation message and include the generated password exactly as: 'Generated Password: <password>'.
+"""
+
+TALEO_PROMPT_TEMPLATE = """
+You are an expert autonomous application assistant. The URL is on Taleo or a legacy career portal.
+CRITICAL LOGIN RULES - AVOID GOOGLE SSO:
+- NEVER click "Continue with Google", "Sign in with Google", or "Apply with LinkedIn".
+- ALWAYS look for and click "Apply Manually", "Use Email and Password", "Create Account", or "Register".
+1. If prompted to sign in, find and click 'Create Account' or 'Register'.
+2. Use the profile data to fill the registration form.
+3. Use the generated email and password, and store the password clearly as 'Generated Password: <password>'.
+4. Upload the resume from '{resume_path}'.
+5. Submit the application and wait for a confirmation screen.
+"""
+
+GENERIC_PROMPT_TEMPLATE = """
+You are an intelligent job application assistant. Use the provided profile data to complete the application.
+CRITICAL LOGIN RULES - AVOID GOOGLE SSO:
+- NEVER click "Continue with Google", "Sign in with Google", or "Apply with LinkedIn".
+- ALWAYS look for and click "Apply Manually", "Use Email and Password", "Create Account", or "Register".
+- If presented with a login choice, choose the native email/password route.
+- If there is a manual account creation path, prioritize it over SSO.
+- Do not try to bypass Google SSO with the browser debugger.
+- Use the provided profile information and generated credentials instead.
+- If this is a credential creation flow, output 'Generated Password: <password>' in the final response.
+- If there is a resume upload, attach '{resume_path}'.
+- Do not invent answers for EEO or certification questions.
+"""
 
 
 def read_json(path, default):
@@ -34,13 +152,39 @@ def write_json(path, value):
         json.dump(value, f, indent=2)
 
 
+def resolve_resume_path(profile):
+    explicit_path = profile.get("resume_path")
+    if explicit_path and Path(explicit_path).exists():
+        return explicit_path
+
+    folder = profile.get("resume_folder")
+    if folder:
+        folder_path = Path(folder)
+        if folder_path.is_dir():
+            pdfs = sorted(folder_path.glob("*.pdf"))
+            if pdfs:
+                return str(pdfs[0])
+    return explicit_path
+
+
 def append_failed(url, reason):
     with open(FAILED_PATH, "a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{url}\t{reason}\n")
 
 
+def browser_agent_available():
+    return Agent is not None and ChatOpenAI is not None
+
+
+def build_browser_use_browser():
+    cdp_url = get_chrome_cdp_url()
+    if not cdp_url or Browser is None or BrowserConfig is None:
+        return None
+    return Browser(config=BrowserConfig(cdp_url=cdp_url))
+
+
 def generate_credentials(profile):
-    base_email = profile.get("email", "applicant@example.com")
+    base_email = profile.get("contact_info", {}).get("email", "applicant@example.com")
     if "@" in base_email:
         local, domain = base_email.split("@", 1)
     else:
@@ -50,15 +194,86 @@ def generate_credentials(profile):
     return email, password
 
 
+def save_account_credentials(company_name, email, password):
+    accounts = read_json(ACCOUNTS_PATH, {})
+    accounts.setdefault(company_name, []).append({
+        "email": email,
+        "password": password,
+        "status": "Created",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    write_json(ACCOUNTS_PATH, accounts)
+
+
+def parse_generated_password(text):
+    if not text:
+        return None
+    for line in text.splitlines():
+        if "Generated Password:" in line:
+            return line.split("Generated Password:", 1)[1].strip()
+        if "Password:" in line:
+            return line.split("Password:", 1)[1].strip()
+    return None
+
+
+def build_agent_task(url, profile):
+    email = profile.get("contact_info", {}).get("email", "")
+    resume_path = profile.get("resume_path", "")
+    if "workday" in url.lower():
+        prompt = WORKDAY_PROMPT_TEMPLATE.format(email=email, resume_path=resume_path)
+    elif "taleo" in url.lower():
+        prompt = TALEO_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    else:
+        prompt = GENERIC_PROMPT_TEMPLATE.format(resume_path=resume_path)
+    return f"Profile Context:\n{json.dumps(profile, indent=2)}\n\nTask:\n{prompt}\n\nTarget URL: {url}"
+
+
+async def run_browser_agent(task, resume_path):
+    if not browser_agent_available():
+        raise RuntimeError("browser_use or langchain_openai is not installed")
+
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    browser = build_browser_use_browser()
+    agent_kwargs = {
+        "task": task,
+        "llm": llm,
+        "available_file_paths": [resume_path],
+    }
+    if browser:
+        agent_kwargs["browser"] = browser
+    agent = Agent(**agent_kwargs)
+
+    try:
+        maybe_response = await asyncio.wait_for(asyncio.to_thread(agent.run), timeout=300)
+        if asyncio.iscoroutine(maybe_response):
+            response = await asyncio.wait_for(maybe_response, timeout=300)
+        else:
+            response = maybe_response
+    except asyncio.TimeoutError:
+        raise asyncio.TimeoutError("browser agent timed out after 300 seconds")
+
+    if hasattr(response, "final_result"):
+        response = response.final_result()
+    return str(response)
+
+
+def resolve_agent_response(result):
+    if isinstance(result, str):
+        return result
+    if hasattr(result, "final_result"):
+        return result.final_result()
+    return str(result)
+
+
 def fill_common_fields(page, profile, email, password):
     fields = {
         "input[name='email']": email,
         "input[name='username']": email,
         "input[name='password']": password,
         "input[name='confirm_password']": password,
-        "input[name='first_name']": profile.get("first_name", profile.get("name", "")),
-        "input[name='last_name']": profile.get("last_name", ""),
-        "input[name='phone']": profile.get("phone", ""),
+        "input[name='first_name']": profile.get("contact_info", {}).get("name", ""),
+        "input[name='last_name']": profile.get("contact_info", {}).get("name", ""),
+        "input[name='phone']": profile.get("contact_info", {}).get("phone", ""),
     }
     for selector, value in fields.items():
         try:
@@ -89,11 +304,6 @@ def safe_click(page, query):
     return False
 
 
-def has_confirmation(page):
-    text = page.content().lower()
-    return any(substring in text for substring in ["thank you", "application submitted", "confirmation", "we received your application"])
-
-
 def process_linkedin(page, resume_path):
     if safe_click(page, "button:has-text('Easy Apply'), a:has-text('Easy Apply')"):
         pass
@@ -107,7 +317,28 @@ def process_linkedin(page, resume_path):
     return False, "linkedin-no-submit"
 
 
-def process_workday(page, profile, resume_path, email, password):
+def process_generic_career_site(page, profile, resume_path, email, password):
+    fill_common_fields(page, profile, email, password)
+    upload_resume(page, resume_path)
+    if safe_click(page, "button:has-text('Submit'), button:has-text('Apply'), input[type='submit']"):
+        return True, "submitted"
+    return False, "generic-no-submit"
+
+
+def process_with_browser_agent(url, profile):
+    task = build_agent_task(url, profile)
+    resume_path = profile.get("resume_path", "")
+    try:
+        response_text = asyncio.run(run_browser_agent(task, resume_path))
+    except asyncio.TimeoutError as e:
+        return str(e), None
+    except Exception as e:
+        return f"browser agent error: {e}", None
+    password = parse_generated_password(response_text)
+    return response_text, password
+
+
+def process_workday_fallback(page, profile, resume_path, email, password):
     fill_common_fields(page, profile, email, password)
     upload_resume(page, resume_path)
     if safe_click(page, "button:has-text('Apply'), button:has-text('Submit')"):
@@ -119,7 +350,7 @@ def process_workday(page, profile, resume_path, email, password):
     return False, "workday-no-submit"
 
 
-def process_taleo(page, profile, resume_path, email, password):
+def process_taleo_fallback(page, profile, resume_path, email, password):
     fill_common_fields(page, profile, email, password)
     upload_resume(page, resume_path)
     if safe_click(page, "button:has-text('Submit application'), button:has-text('Submit'), button:has-text('Apply')"):
@@ -127,45 +358,14 @@ def process_taleo(page, profile, resume_path, email, password):
     return False, "taleo-no-submit"
 
 
-def process_generic_career_site(page, profile, resume_path, email, password):
-    fill_common_fields(page, profile, email, password)
-    upload_resume(page, resume_path)
-    if safe_click(page, "button:has-text('Submit'), button:has-text('Apply'), input[type='submit']"):
-        return True, "submitted"
-    return False, "generic-no-submit"
-
-
-def choose_executor(page, url, profile, resume_path):
-    if "linkedin.com/jobs" in url:
-        result, reason = process_linkedin(page, resume_path)
-        return result, reason, None, None
-    if "workday" in url:
-        email, password = generate_credentials(profile)
-        result, reason = process_workday(page, profile, resume_path, email, password)
-        return result, reason, email, password
-    if "taleo" in url:
-        email, password = generate_credentials(profile)
-        result, reason = process_taleo(page, profile, resume_path, email, password)
-        return result, reason, email, password
-    email, password = generate_credentials(profile)
-    result, reason = process_generic_career_site(page, profile, resume_path, email, password)
-    return result, reason, email, password
-
-
 def record_account(url, email, password):
-    host = urlparse(url).hostname or "unknown"
-    accounts = read_json(ACCOUNTS_PATH, {})
-    accounts.setdefault(host, []).append({
-        "email": email,
-        "password": password,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    write_json(ACCOUNTS_PATH, accounts)
+    company = urlparse(url).hostname or "unknown"
+    save_account_credentials(company, email, password)
 
 
 def run_executor():
     profile = read_json(PROFILE_PATH, {})
-    resume_path = profile.get("resume_path")
+    resume_path = resolve_resume_path(profile)
     if not resume_path or not Path(resume_path).exists():
         send_message("Executor: resume_path missing or not found in profile.json.")
         return
@@ -175,74 +375,143 @@ def run_executor():
         send_message("Executor: queue.json is empty.")
         return
 
+    # Verification step: ensure the warmed Chrome profile is actually logged in
+    def verify_profile_and_send(profile_dir, chrome_path, cdp_url, queued_urls):
+        try:
+            with sync_playwright() as p:
+                browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
+                page = get_or_create_page(context)
+                page.set_default_navigation_timeout(60000)
+
+                # Check Google login status
+                google_ok = False
+                try:
+                    page.goto("https://www.google.com")
+                    time.sleep(1)
+                    # if 'Sign in' text is present, assume not signed in
+                    body = page.content()
+                    if "Sign in" not in body and "Sign in" not in (page.title() or ""):
+                        google_ok = True
+                except Exception:
+                    pass
+
+                # Check LinkedIn login status
+                linkedin_ok = False
+                try:
+                    page.goto("https://www.linkedin.com/feed")
+                    time.sleep(2)
+                    # if redirected to login or url contains 'login', consider not signed in
+                    cur_url = page.url or ""
+                    body = page.content()
+                    if "login" not in cur_url.lower() and "Sign in" not in body:
+                        linkedin_ok = True
+                except Exception:
+                    pass
+
+                # Take a screenshot for manual verification
+                ts = int(time.time())
+                shot_path = SCREENSHOT_DIR / f"pre_run_{ts}.png"
+                try:
+                    page.screenshot(path=str(shot_path), full_page=True)
+                except Exception:
+                    pass
+
+                close_playwright_session(browser, context, cdp_url)
+
+                summary = f"Verification results - Google:{google_ok} LinkedIn:{linkedin_ok}"
+                send_message(f"Executor verification: using profile {str(profile_dir)}")
+                send_message(summary)
+                send_photo(str(shot_path), caption=f"Pre-run verification: {summary}")
+
+                # If we have LinkedIn jobs queued but LinkedIn isn't signed in, abort
+                if any("linkedin.com" in (u if isinstance(u, str) else u.get("url", "") ) for u in queued_urls) and not linkedin_ok:
+                    send_message("Executor abort: LinkedIn appears not signed in in the warmed profile. Please run ./run.sh warmup and log in, then retry.")
+                    return False
+
+                return True
+        except Exception as e:
+            send_message(f"Executor verification error: {e}")
+            return False
+
+    profile_dir = get_browser_profile_path()
+    chrome_path = os.getenv("CHROME_PATH")
+    cdp_url = get_chrome_cdp_url()
+
+    # Run verification before processing the queue
+    ok = verify_profile_and_send(profile_dir, chrome_path, cdp_url, queue)
+    if not ok:
+        return
+
     states = set(read_json(STATE_PATH, []))
-    profile_dir = os.getenv("BROWSER_PROFILE_PATH")
+    profile_dir = get_browser_profile_path()
+    chrome_path = os.getenv("CHROME_PATH")
+    cdp_url = get_chrome_cdp_url()
 
     for item in queue:
         url = item["url"] if isinstance(item, dict) else item
-        job_type = item.get("type", "EASY_APPLY") if isinstance(item, dict) else "EASY_APPLY"
         if url in states:
             continue
 
         start_ts = time.time()
+        result = False
+        reason = "unknown"
+        screenshot_path = SCREENSHOT_DIR / f"{int(time.time())}.png"
+
         try:
-            with sync_playwright() as p:
-                if profile_dir:
-                    context = p.chromium.launch_persistent_context(user_data_dir=profile_dir, headless=True)
+            if "workday" in url.lower() or "taleo" in url.lower():
+                if browser_agent_available():
+                    response_text, password = process_with_browser_agent(url, profile)
+                    result = "application submitted" in response_text.lower() or "thank you" in response_text.lower() or "submitted" in response_text.lower()
+                    if password:
+                        record_account(url, profile.get("contact_info", {}).get("email", ""), password)
+                    reason = response_text[:512]
                 else:
-                    browser = p.chromium.launch(headless=True)
-                    context = browser.new_context()
-                page = context.new_page()
-                page.set_default_navigation_timeout(120000)
-                page.goto(url)
-                time.sleep(2)
-
-                result = False
-                reason = "unknown"
-                account_email = None
-                account_password = None
-                account_email = None
-                account_password = None
-                if "linkedin.com/jobs" in url:
-                    result, reason = process_linkedin(page, resume_path)
-                elif "workday" in url or "taleo" in url:
-                    result, reason, account_email, account_password = choose_executor(page, url, profile, resume_path)
-                    if result and account_email and account_password:
-                        record_account(url, account_email, account_password)
-                else:
-                    if job_type == "EASY_APPLY":
-                        if "linkedin.com/jobs" in url:
-                            result, reason = process_linkedin(page, resume_path)
+                    with sync_playwright() as p:
+                        browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
+                        page = get_or_create_page(context)
+                        page.set_default_navigation_timeout(120000)
+                        page.goto(url)
+                        time.sleep(2)
+                        email, password = generate_credentials(profile)
+                        if "workday" in url.lower():
+                            result, reason = process_workday_fallback(page, profile, resume_path, email, password)
                         else:
-                            email, password = generate_credentials(profile)
-                            result, reason = process_generic_career_site(page, profile, resume_path, email, password)
-                            if result:
-                                record_account(url, email, password)
+                            result, reason = process_taleo_fallback(page, profile, resume_path, email, password)
+                        if result:
+                            record_account(url, email, password)
+                        try:
+                            page.screenshot(path=str(screenshot_path), full_page=True)
+                        except Exception:
+                            pass
+                        close_playwright_session(browser, context, cdp_url)
+            else:
+                with sync_playwright() as p:
+                    browser, context = connect_playwright_context(p, cdp_url, profile_dir, chrome_path)
+                    page = get_or_create_page(context)
+                    page.set_default_navigation_timeout(120000)
+                    page.goto(url)
+                    time.sleep(2)
+                    if "linkedin.com/jobs" in url.lower():
+                        result, reason = process_linkedin(page, resume_path)
                     else:
-                        result, reason, account_email, account_password = choose_executor(page, url, profile, resume_path)
-                        if result and account_email and account_password:
-                            record_account(url, account_email, account_password)
+                        email, password = generate_credentials(profile)
+                        result, reason = process_generic_career_site(page, profile, resume_path, email, password)
+                        if result:
+                            record_account(url, email, password)
+                    try:
+                        page.screenshot(path=str(screenshot_path), full_page=True)
+                    except Exception:
+                        pass
+                    close_playwright_session(browser, context, cdp_url)
 
-                screenshot_path = SCREENSHOT_DIR / f"{int(time.time())}.png"
-                try:
-                    page.screenshot(path=str(screenshot_path), full_page=True)
-                except Exception:
-                    pass
+            if result:
+                states.add(url)
+                write_json(STATE_PATH, list(states))
+                send_photo(str(screenshot_path), caption=f"Applied: {url}")
+            else:
+                append_failed(url, reason)
+                send_message(f"Failed to apply to {url}: {reason}")
 
-                if result:
-                    states.add(url)
-                    write_json(STATE_PATH, list(states))
-                    send_photo(str(screenshot_path), caption=f"Applied: {url}")
-                else:
-                    append_failed(url, reason)
-                    send_message(f"Failed to apply to {url}: {reason}")
-
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                if not profile_dir:
-                    browser.close()
         except Exception as e:
             append_failed(url, str(e))
             send_message(f"Executor error for {url}: {e}")

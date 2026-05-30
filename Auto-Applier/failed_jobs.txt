@@ -1,1 +1,10 @@
 # Failed jobs list for Auto-Applier
+2026-05-30 10:06:37	https://example.com/test-job-123	BrowserType.connect_over_cdp: connect ECONNREFUSED ::1:9222
+Call log:
+  - <ws preparing> retrieving websocket url from http://localhost:9222
+
+2026-05-30 10:06:38	https://www.linkedin.com/jobs/	BrowserType.connect_over_cdp: connect ECONNREFUSED ::1:9222
+Call log:
+  - <ws preparing> retrieving websocket url from http://localhost:9222
+
+2026-05-30 10:10:06	https://www.linkedin.com/jobs/	linkedin-no-submit
